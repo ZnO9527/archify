@@ -2253,9 +2253,12 @@ function runNode(args, options = {}) {
     maxBuffer: options.maxBuffer ?? DEFAULT_MAX_BUFFER,
     env: options.env ? { ...process.env, ...options.env } : process.env,
   });
-  // The child can exit before a piped-output overflow is observed. A capture
-  // error still means the operation failed, even when its exit status is zero.
-  if (result.error && result.status === 0) result.status = 1;
+  // spawnSync can report a system failure after a child has exited zero. A
+  // truncated renderer or checker result is never a successful invocation.
+  if (result.error && result.status === 0) {
+    result.archifyRawStatus = result.status;
+    result.status = 1;
+  }
   return result;
 }
 
@@ -2283,7 +2286,7 @@ function checkerOutputLimitDiagnostics(check, limitBytes) {
     evidence: {
       systemCode: check.error.code,
       ...(check.signal ? { signal: check.signal } : {}),
-      status: check.status ?? null,
+      status: check.archifyRawStatus ?? check.status ?? null,
       limitBytes,
       receivedBytes,
     },
@@ -3600,10 +3603,10 @@ function renderValidatedArchitecture(inputPath, outputPath, quality, repoRoot, c
     stdio: 'pipe',
     maxBuffer: checkMaxBuffer,
   });
-  if (check.status !== 0) {
+  if (check.error || check.status !== 0) {
     const error = new Error('Validated snapshot failed final artifact checks.');
     error.compareStage = 'check';
-    error.compareStatus = check.status ?? 1;
+    error.compareStatus = check.status || 1;
     const outputLimit = checkerOutputLimitDiagnostics(check, checkMaxBuffer);
     if (outputLimit) {
       error.diagnostics = outputLimit;
@@ -4318,7 +4321,7 @@ function writeDeliveryFailureReceipt(options) {
 }
 
 function reportValidateFailure(options) {
-  reportArtifactFailure({ ...options, command: 'validate' });
+  reportArtifactFailure({ ...options, command: options.command || 'validate' });
 }
 
 function reportArtifactArgumentFailure(command, error) {
@@ -4842,7 +4845,7 @@ async function commandDeliver(args) {
       stdio: 'pipe',
       maxBuffer: checkMaxBuffer,
     });
-    if (check.status !== 0) {
+    if (check.error || check.status !== 0) {
       if (check.stderr) process.stderr.write(check.stderr);
       const outputLimit = checkerOutputLimitDiagnostics(check, checkMaxBuffer);
       if (outputLimit) {
@@ -4854,7 +4857,7 @@ async function commandDeliver(args) {
           output: outputPath,
           error: `The artifact checker exceeded its ${checkMaxBuffer} byte output buffer and was terminated before reporting a verdict; the previous artifact was preserved.`,
           diagnostics: outputLimit,
-          status: check.status ?? 1,
+          status: check.status || 1,
         });
         return;
       }
@@ -4873,7 +4876,7 @@ async function commandDeliver(args) {
         output: outputPath,
         error: 'Final artifact check failed; the previous artifact was preserved.',
         diagnostics: checkerDiagnostics(checker),
-        status: check.status ?? 1,
+        status: check.status || 1,
         checker,
       });
       return;
@@ -6513,7 +6516,7 @@ async function commandMigrate(args) {
       stdio: 'pipe',
       maxBuffer: checkMaxBuffer,
     });
-    if (check.status !== 0) {
+    if (check.error || check.status !== 0) {
       const outputLimit = checkerOutputLimitDiagnostics(check, checkMaxBuffer);
       if (outputLimit) {
         reportMigrationFailure({
@@ -6522,7 +6525,7 @@ async function commandMigrate(args) {
             ...migration.newSchemaDiagnostics,
             ...outputLimit,
           ],
-          status: check.status ?? 1,
+          status: check.status || 1,
         });
         return;
       }
@@ -6538,7 +6541,7 @@ async function commandMigrate(args) {
           ...migration.newSchemaDiagnostics,
           ...checkerDiagnostics(checker),
         ],
-        status: check.status ?? 1,
+        status: check.status || 1,
       });
       return;
     }
@@ -6818,6 +6821,7 @@ async function commandMigrate(args) {
 // attributed to the command the caller actually invoked.
 async function commandValidate(args, invocation = {}) {
   const invokingCommand = invocation.command || 'validate';
+  const reportFailure = (options) => reportValidateFailure({ ...options, command: invokingCommand });
   const qualityArgs = extractQualityArgs(args);
   const repoArgs = extractRepoRootArgs(qualityArgs.rest);
   args = repoArgs.rest;
@@ -6861,7 +6865,7 @@ async function commandValidate(args, invocation = {}) {
     else validateAuthoredOutputPath(document.meta.output);
   } catch (error) {
     const diagnostics = error.archifyDiagnostics || [inputDiagnostic(error, inputPath)];
-    reportValidateFailure({
+    reportFailure({
       json,
       stage: diagnostics.some((entry) => entry.code.startsWith('input/')) ? 'input' : 'render',
       type,
@@ -6893,7 +6897,7 @@ async function commandValidate(args, invocation = {}) {
         // receipt was produced (for example, input JSON could not be read).
       }
       const failure = rendererFailure(result);
-      reportValidateFailure({
+      reportFailure({
         json,
         stage: failure.diagnostics.some((entry) => entry.code.startsWith('input/')) ? 'input' : 'render',
         type,
@@ -6924,7 +6928,7 @@ async function commandValidate(args, invocation = {}) {
     });
     if (render.status !== 0) {
       const failure = rendererFailure(render);
-      report = () => reportValidateFailure({
+      report = () => reportFailure({
         json,
         stage: failure.diagnostics.some((entry) => entry.code.startsWith('input/')) ? 'input' : 'render',
         type,
@@ -6941,18 +6945,18 @@ async function commandValidate(args, invocation = {}) {
         stdio: 'pipe',
         maxBuffer: checkMaxBuffer,
       });
-      if (check.status !== 0) {
-        exitCode = check.status ?? 1;
+      if (check.error || check.status !== 0) {
+        exitCode = check.status || 1;
         const outputLimit = checkerOutputLimitDiagnostics(check, checkMaxBuffer);
         if (outputLimit) {
-          report = () => reportValidateFailure({
+          report = () => reportFailure({
             json,
             stage: 'check',
             type,
             input: path.resolve(input),
             error: `The artifact checker exceeded its ${checkMaxBuffer} byte output buffer and was terminated before reporting a verdict.`,
             diagnostics: outputLimit,
-            status: check.status ?? 1,
+            status: check.status || 1,
           });
         } else {
           let checker;
@@ -6962,7 +6966,7 @@ async function commandValidate(args, invocation = {}) {
           } catch {
             checker = { ok: false, diagnostic: 'Artifact checker failed without a parseable receipt.' };
           }
-          report = () => reportValidateFailure({
+          report = () => reportFailure({
             json,
             stage: 'check',
             type,
@@ -6970,7 +6974,7 @@ async function commandValidate(args, invocation = {}) {
             error: 'Final artifact check failed.',
             diagnostics: checkerDiagnostics(checker),
             checker,
-            status: check.status ?? 1,
+            status: check.status || 1,
           });
         }
       } else {
@@ -7024,7 +7028,7 @@ async function commandValidate(args, invocation = {}) {
       await temporary.cleanup();
     } catch (error) {
       exitCode = 1;
-      report = () => reportValidateFailure({
+      report = () => reportFailure({
         json,
         stage: 'cleanup',
         type,
